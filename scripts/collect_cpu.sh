@@ -23,20 +23,32 @@ fi
 compute_utilization_pct() {
   # Use mpstat to get CPU utilization (5 second sample for better accuracy)
   # Output format: CPU minf mjf xcal  intr ithr  csw icsw migr smtx  srw syscl  usr sys  wt idl
-  # Last field is idle percentage
-  local idle_pct
-  idle_pct=$(mpstat 5 1 2>/dev/null | tail -1 | awk '{print $NF}')
+  # Fields: usr=13, sys=14, wt=15, idl=16
+  local idle_pct sys_pct usr_pct
+  local mpstat_output
+  mpstat_output=$(mpstat 5 1 2>/dev/null | tail -1)
   
-  if [ -z "${idle_pct}" ] || [ "${idle_pct}" = "idl" ]; then
-    log ERROR "Unable to read CPU idle percentage via mpstat"
-    echo "null"
+  if [ -z "${mpstat_output}" ]; then
+    log ERROR "Unable to read CPU stats via mpstat"
+    echo "null null null null"
     return
   fi
   
-  log DEBUG "mpstat idle=${idle_pct}%"
+  usr_pct=$(echo "${mpstat_output}" | awk '{print $(NF-3)}')
+  sys_pct=$(echo "${mpstat_output}" | awk '{print $(NF-2)}')
+  idle_pct=$(echo "${mpstat_output}" | awk '{print $NF}')
+  
+  if [ -z "${idle_pct}" ] || [ "${idle_pct}" = "idl" ]; then
+    log ERROR "Unable to parse CPU percentages via mpstat"
+    echo "null null null null"
+    return
+  fi
+  
+  log DEBUG "mpstat usr=${usr_pct}% sys=${sys_pct}% idle=${idle_pct}%"
   
   # Calculate utilization as (100 - idle) / 100 for 0-1 scale with 6 decimals
-  awk -v idl="${idle_pct}" 'BEGIN{printf "%.6f", (100.0 - idl) / 100.0}'
+  # Output: utilization, idle, user, system (all normalized to 0-1 scale)
+  awk -v idl="${idle_pct}" -v usr="${usr_pct}" -v sys="${sys_pct}" 'BEGIN{printf "%.6f %.6f %.6f %.6f", (100.0 - idl) / 100.0, idl / 100.0, usr / 100.0, sys / 100.0}'
 }
 
 load_averages() {
@@ -59,8 +71,10 @@ $(load_averages)
 EOF
   local cores
   cores=$(logical_cores)
-  local util_pct
-  util_pct=$(compute_utilization_pct)
+  local util_pct idle_pct usr_pct sys_pct
+  read -r util_pct idle_pct usr_pct sys_pct <<EOF
+$(compute_utilization_pct)
+EOF
 
   local payload_file
   payload_file=$(mktemp /var/tmp/cpu_payload.XXXXXX)
@@ -78,9 +92,9 @@ EOF
     printf '"cpu":{'
     printf '"cores":%s,' "${cores}"
     if [ "${util_pct}" = "null" ]; then
-      printf '"total":{"norm":{"pct":null}}'
+      printf '"total":{"norm":{"pct":null},"idle":{"pct":null},"user":{"pct":null},"system":{"pct":null}}'
     else
-      printf '"total":{"norm":{"pct":%s}}' "${util_pct}"
+      printf '"total":{"norm":{"pct":%s},"idle":{"pct":%s},"user":{"pct":%s},"system":{"pct":%s}}' "${util_pct}" "${idle_pct}" "${usr_pct}" "${sys_pct}"
     fi
     printf '},'
     printf '"load":{"1":%s,"5":%s,"15":%s,"cores":%s}' "${load1}" "${load5}" "${load15}" "${cores}"
