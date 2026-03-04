@@ -17,9 +17,17 @@ fi
 . "${CONFIG_FILE}"
 
 DATA_STREAM_NAME="${DATA_STREAM_TYPE}-${DATA_STREAM_DATASET}-${DATA_STREAM_NAMESPACE}"
+
+# Set up endpoint and validation based on target
 CURL_VERIFY_FLAG=""
-if [ "${ELASTIC_VALIDATE_CERT}" = "no" ]; then
-  CURL_VERIFY_FLAG="-k"
+if [ "${TARGET}" = "elastic" ]; then
+  if [ "${ELASTIC_VALIDATE_CERT}" = "no" ]; then
+    CURL_VERIFY_FLAG="-k"
+  fi
+elif [ "${TARGET}" = "logstash" ]; then
+  if [ "${LOGSTASH_VALIDATE_CERT}" = "no" ]; then
+    CURL_VERIFY_FLAG="-k"
+  fi
 fi
 
 # Logging helpers
@@ -141,7 +149,7 @@ ndjson_append_with_limit() {
   fi
 }
 
-# Send NDJSON file to Elastic with retries; respects DRY_RUN
+# Send NDJSON file to target (Elasticsearch or Logstash) with retries; respects DRY_RUN
 send_ndjson_file() {
   local ndjson_file="$1"
 
@@ -154,39 +162,67 @@ send_ndjson_file() {
   local attempt=1
   local backoff=1
   local resp_body resp_code curl_output curl_status
+  local endpoint auth_header target_name
+  
+  # Determine endpoint and auth header based on target
+  if [ "${TARGET}" = "elastic" ]; then
+    endpoint="${ELASTIC_ENDPOINT}/_bulk"
+    auth_header="-H \"Authorization: ApiKey ${ELASTIC_API_KEY}\""
+    target_name="Elasticsearch"
+  elif [ "${TARGET}" = "logstash" ]; then
+    endpoint="${LOGSTASH_PROTOCOL}://${LOGSTASH_HOST}:${LOGSTASH_PORT}"
+    auth_header=""
+    target_name="Logstash"
+  else
+    log ERROR "Unknown TARGET: ${TARGET}. Must be 'elastic' or 'logstash'"
+    return 1
+  fi
+
   while [ "${attempt}" -le "${HTTP_RETRIES}" ]; do
-    resp_body="$(mktemp /var/tmp/elastic_resp.XXXXXX)"
-    curl_output=$(curl -sS ${CURL_VERIFY_FLAG} -X POST "${ELASTIC_ENDPOINT}/_bulk" \
-      -H "Content-Type: application/x-ndjson" \
-      -H "Authorization: ApiKey ${ELASTIC_API_KEY}" \
-      --max-time "${HTTP_TIMEOUT_SECONDS}" \
-      --data-binary "@${ndjson_file}" \
-      -o "${resp_body}" -w "%{http_code}")
+    resp_body="$(mktemp /var/tmp/target_resp.XXXXXX)"
+    
+    # Build curl command with conditional auth header
+    local curl_cmd
+    if [ -n "${auth_header}" ]; then
+      curl_cmd="curl -sS ${CURL_VERIFY_FLAG} -X POST \"${endpoint}\" ${auth_header} -H \"Content-Type: application/x-ndjson\" --max-time \"${HTTP_TIMEOUT_SECONDS}\" --data-binary \"@${ndjson_file}\" -o \"${resp_body}\" -w \"%{http_code}\""
+    else
+      curl_cmd="curl -sS ${CURL_VERIFY_FLAG} -X POST \"${endpoint}\" -H \"Content-Type: application/x-ndjson\" --max-time \"${HTTP_TIMEOUT_SECONDS}\" --data-binary \"@${ndjson_file}\" -o \"${resp_body}\" -w \"%{http_code}\""
+    fi
+    
+    curl_output=$(eval "${curl_cmd}")
     curl_status=$?
     resp_code="${curl_output}"
 
-    # Treat HTTP 2xx/3xx as success; everything else logs and retries
+    # Handle response based on target
     if [ "${curl_status}" -eq 0 ]; then
       case "${resp_code}" in
-        2*|3*)
-          if /usr/bin/egrep '"errors":false' "${resp_body}" >/dev/null 2>&1; then
-            log INFO "Sent ${ndjson_file} (attempt ${attempt}, HTTP ${resp_code})"
+        2*)
+          if [ "${TARGET}" = "elastic" ]; then
+            # For Elasticsearch, verify no errors in response
+            if /usr/bin/egrep '"errors":false' "${resp_body}" >/dev/null 2>&1; then
+              log INFO "Sent ${ndjson_file} to ${target_name} (attempt ${attempt}, HTTP ${resp_code})"
+              rm -f "${resp_body}"
+              return 0
+            else
+              log WARN "${target_name} bulk response contains errors (attempt ${attempt}, HTTP ${resp_code})"
+              log DEBUG "Response body: $(cat "${resp_body}")"
+            fi
+          else
+            # For Logstash, 2xx response is success
+            log INFO "Sent ${ndjson_file} to ${target_name} (attempt ${attempt}, HTTP ${resp_code})"
             rm -f "${resp_body}"
             return 0
-          else
-            log WARN "Elastic bulk response contains errors (attempt ${attempt}, HTTP ${resp_code})"
-            log DEBUG "Response body: $(cat "${resp_body}")"
           fi
           ;;
         *)
-          log WARN "HTTP send failed (attempt ${attempt}, status ${curl_status}, code ${resp_code})"
+          log WARN "HTTP send to ${target_name} failed (attempt ${attempt}, status ${curl_status}, code ${resp_code})"
           if [ -s "${resp_body}" ]; then
             log DEBUG "Response body: $(cat "${resp_body}")"
           fi
           ;;
       esac
     else
-      log WARN "curl error (attempt ${attempt}, status ${curl_status}, code ${resp_code})"
+      log WARN "curl error to ${target_name} (attempt ${attempt}, status ${curl_status}, code ${resp_code})"
       if [ -s "${resp_body}" ]; then
         log DEBUG "Response body: $(cat "${resp_body}")"
       fi
@@ -200,7 +236,7 @@ send_ndjson_file() {
     sleep "${backoff}"
   done
 
-  log ERROR "Failed to send payload after ${HTTP_RETRIES} attempts"
+  log ERROR "Failed to send payload to ${target_name} after ${HTTP_RETRIES} attempts"
   return 1
 }
 
@@ -239,8 +275,11 @@ send_or_buffer() {
 }
 
 # Build the bulk action line for the configured data stream
+# Only output the action line for Elasticsearch; Logstash doesn't need it
 bulk_action_line() {
-  printf '{"create":{"_index":"%s"}}\n' "${DATA_STREAM_NAME}"
+  if [ "${TARGET}" = "elastic" ]; then
+    printf '{"create":{"_index":"%s"}}\n' "${DATA_STREAM_NAME}"
+  fi
 }
 
 # Common ECS envelope for host fields
